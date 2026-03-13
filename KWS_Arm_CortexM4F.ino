@@ -1,18 +1,24 @@
-#include <Arduino.h>
-#include <PDM.h>
-#include "arm_math.h"
+// ===============================
+// Macros to enable DSP / CMSIS-NN
+// ===============================
+#define ARM_MATH_DSP           // Enable DSP-optimized math (SIMD/FPU on Cortex-M4)
+#define ARM_MATH_LOOPUNROLL    // Enable loop unrolling in CMSIS-DSP
+#define TF_LITE_USE_CMSIS_NN   // Force TensorFlow Lite Micro to use CMSIS-NN kernels for int8
 
-// TensorFlow Lite Micro
-#include <TensorFlowLite.h>
-#include "tensorflow/lite/micro/micro_error_reporter.h"
-#include "tensorflow/lite/micro/micro_interpreter.h"
-#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
-#include "tensorflow/lite/schema/schema_generated.h"
-#include "tensorflow/lite/version.h"
+// ===============================
+// Include necessary libraries
+// ===============================
+#include <Arduino.h>           // Core Arduino functions
+#include <PDM.h>               // PDM audio
+#include <arm_math.h>          // CMSIS-DSP math functions (FFT, filters, etc.)
+#include <TensorFlowLite.h>    // Core TensorFlow Lite Micro
+#include <tensorflow/lite/micro/micro_error_reporter.h>
+#include <tensorflow/lite/micro/micro_interpreter.h>
+#include <tensorflow/lite/micro/micro_mutable_op_resolver.h>
+#include <tensorflow/lite/schema/schema_generated.h>
+#include <tensorflow/lite/micro/micro_profiler.h>
 
-// =======================
 // Model include
-// =======================
 #include "kws_1class_depthwise_int8.h"
 #include "mel_filter_coefs.h"
 
@@ -26,7 +32,8 @@
 #define SPECTRUM_BINS (FRAME_SIZE / 2 + 1)
 #define NUM_MEL 40
 #define NUM_FRAMES 61
-#define THRESHOLD 0.8
+#define THRESHOLD 0.8f
+
 // =======================
 // Audio buffers
 // =======================
@@ -64,6 +71,7 @@ const tflite::Model* model = nullptr;
 tflite::MicroInterpreter* interpreter = nullptr;
 TfLiteTensor* input = nullptr;
 TfLiteTensor* output = nullptr;
+static tflite::MicroProfiler profiler;
 
 float input_scale;
 int32_t input_zero_point;
@@ -75,12 +83,9 @@ int32_t output_zero_point;
 // =======================
 void onPDMData() {
   int bytes = PDM.available();
-
-  if (bytes <= 0)
-    return;
+  if (bytes <= 0) return;
 
   int samples = PDM.read(pdmBuffer, bytes) / 2;
-
   for (int i = 0; i < samples; i++)
     audioBuffer[i] = pdmBuffer[i];
 
@@ -101,7 +106,12 @@ void computeHannWindow() {
 void computeLogMel() {
   arm_mult_f32(audioFrame, hannWindow, windowed, FRAME_SIZE);
   arm_rfft_fast_f32(&fft_inst, windowed, fftOut, 0);
-  arm_cmplx_mag_squared_f32(fftOut, mag, SPECTRUM_BINS);
+
+  for (int i = 0; i < SPECTRUM_BINS; i++) {
+    float real = fftOut[2*i];
+    float imag = fftOut[2*i+1];
+    mag[i] = real*real + imag*imag;
+  }
 
   magVec.pData = mag;
   melOut.pData = melRowTmp;
@@ -127,9 +137,8 @@ void processAudio() {
     firstFrame = false;
     for (int i = 0; i < HOP_SIZE; i++)
       audioFrame[i] = audioBuffer[i] / 32768.0f;
-  } 
-  else {
-    memcpy(audioFrame, audioFrame + HOP_SIZE, HOP_SIZE * sizeof(float));
+  } else {
+    memmove(audioFrame, audioFrame + HOP_SIZE, HOP_SIZE * sizeof(float));
     for (int i = 0; i < HOP_SIZE; i++)
       audioFrame[i + HOP_SIZE] = audioBuffer[i] / 32768.0f;
 
@@ -143,11 +152,9 @@ void processAudio() {
 // =======================
 void setup() {
   Serial.begin(115200);
-  while (!Serial)
-    ;
+  while (!Serial);
 
   arm_rfft_fast_init_f32(&fft_inst, FRAME_SIZE);
-
   arm_mat_init_f32(&melMat, NUM_MEL, SPECTRUM_BINS, (float*)melFilterbank);
   arm_mat_init_f32(&magVec, SPECTRUM_BINS, 1, mag);
   arm_mat_init_f32(&melOut, NUM_MEL, 1, melRowTmp);
@@ -155,38 +162,37 @@ void setup() {
   computeHannWindow();
 
   PDM.onReceive(onPDMData);
-
-  if (!PDM.begin(1, SAMPLE_RATE))
-    while (1)
-      ;
+  if (!PDM.begin(1, SAMPLE_RATE)) while (1);
   PDM.setGain(60);
 
+  // Load TFLite model
   model = tflite::GetModel(kws_1class_depthwise_int8_tflite);
+  if (model->version() != TFLITE_SCHEMA_VERSION) while (1);
 
-  if (model->version() != TFLITE_SCHEMA_VERSION)
-    while (1)
-      ;
-
+  // =======================
+  // Ops resolver (int8 CMSIS-NN will be used automatically)
+  // =======================
   static tflite::MicroMutableOpResolver<4> resolver;
   resolver.AddConv2D();
   resolver.AddDepthwiseConv2D();
   resolver.AddSoftmax();
-  resolver.AddMean();
+  resolver.AddMean(); // optional; reference kernel
 
+  // Interpreter
   static tflite::MicroInterpreter static_interpreter(
-    model, resolver, tensor_arena, kTensorArenaSize, error_reporter);
+    model, resolver, tensor_arena, kTensorArenaSize, nullptr, &profiler);
   interpreter = &static_interpreter;
 
-  if (interpreter->AllocateTensors() != kTfLiteOk)
-    while (1)
-      ;
+  if (interpreter->AllocateTensors() != kTfLiteOk) {
+    error_reporter->Report("AllocateTensors() failed");
+    while (1);
+  }
 
   input = interpreter->input(0);
   output = interpreter->output(0);
 
   input_scale = input->params.scale;
   input_zero_point = input->params.zero_point;
-  
   output_scale = output->params.scale;
   output_zero_point = output->params.zero_point;
 
@@ -197,30 +203,35 @@ void setup() {
 // Arduino loop
 // =======================
 void loop() {
-  if (dataReady) {
-    dataReady = false;
-    processAudio();
+  if (!dataReady) return;
+  dataReady = false;
+  processAudio();
 
-    if (frameCounter == NUM_FRAMES) {
-      frameCounter = 0;
-      firstFrame = true;
+  if (frameCounter >= NUM_FRAMES) {
+    frameCounter = 0;
+    firstFrame = true;
 
-      memcpy(input->data.int8, featureBuffer, NUM_FRAMES * NUM_MEL * sizeof(int8_t));
+    memcpy(input->data.int8, featureBuffer, NUM_FRAMES * NUM_MEL * sizeof(int8_t));
 
-      if (interpreter->Invoke() != kTfLiteOk)
-        Serial.println("Invoke failed");
+    uint32_t t0 = millis();
+    interpreter->Invoke();
+    uint32_t t1 = millis();
 
-      int8_t raw = output->data.int8[0];
-      float prob = output_scale * (raw - output_zero_point);
+    profiler.Log();
+    Serial.print("Inference ms: ");
+    Serial.println(t1 - t0);
 
-      Serial.print("Raw output: ");
-      Serial.print(raw);
-      Serial.print(" Probability: ");
-      Serial.print(prob);
+    int8_t raw = output->data.int8[0];
+    float prob = output_scale * (raw - output_zero_point);
 
-      if(prob > THRESHOLD)
-        Serial.print(" keyword DETECTED!");  
-      Serial.println(" ");
-    }
+    Serial.print("Raw output: ");
+    Serial.print(raw);
+    Serial.print(" Probability: ");
+    Serial.print(prob);
+
+    if(prob > THRESHOLD)
+      Serial.print(" keyword DETECTED!");  
+    Serial.println(" ");
   }
 }
+
