@@ -30,9 +30,9 @@
 #define HOP_SIZE (FRAME_SIZE / 2)
 #define PDM_BUFFER_SIZE (FRAME_SIZE / 2)
 #define SPECTRUM_BINS (FRAME_SIZE / 2 + 1)
-#define NUM_MEL 40
+#define NUM_MEL 20
 #define NUM_FRAMES 61
-#define THRESHOLD 0.8f
+#define THRESHOLD 0.75f
 
 // =======================
 // Audio buffers
