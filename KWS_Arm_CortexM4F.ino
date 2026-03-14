@@ -32,7 +32,7 @@
 #define SPECTRUM_BINS (FRAME_SIZE / 2 + 1)
 #define NUM_MEL 20
 #define NUM_FRAMES 61
-#define THRESHOLD 0.75f
+#define THRESHOLD 0.70f
 
 // =======================
 // Audio buffers
