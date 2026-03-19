@@ -45,7 +45,7 @@ This project implements single-keyword spotting using the Google Speech Commands
 Effectively acts as binary classification:  
 `keyword vs everything else`
 
-The keyword "YES" is chosen for its two phonemes, improving single-word detection reliability.
+The keyword "YES" is chosen for its three phonemes, improving single-word detection reliability.
 
 ---
 
